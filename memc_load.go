@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 )
 
-type user_apps struct {
-	dev_type, dev_id  string
+type userApps struct {
+	devType, devId  string
 	lat, lon float64
 	apps     []uint32
 }
@@ -27,23 +27,24 @@ func newMemcConnection(addresses map[string]string) map[string]*memcache.Client 
 	clients := make(map[string]*memcache.Client, 4)
 	for key, value := range(addresses) {
 		clients[key] = memcache.New(value)
+		clients[key].Timeout = 2
+		clients[key].MaxIdleConns = 3
 	}
 	return clients
 }
 
-func writer_thread(writeCh chan []user_apps, clients map[string]*memcache.Client, numErrors *uint64) {
-	for {
-		uas := <- writeCh
+func writer(writeCh chan []userApps, clients map[string]*memcache.Client, numErrors *uint64) {
+	for uas := range writeCh {
 		var localNumErrors uint64 = 0
 		for _, ua := range(uas) {
 
-			key := fmt.Sprintf("%s:%s", ua.dev_type, ua.dev_id)
+			key := fmt.Sprintf("%s:%s", ua.devType, ua.devId)
 
 			/* Marshall UserApps instance to get value to store */
 			if data, err := proto.Marshal(
 				&apps.UserApps{Apps: ua.apps, Lat: &ua.lat, Lon: &ua.lon});
 				err == nil {
-				if clients[ua.dev_type].Set(&memcache.Item{Key: key, Value: data}) != nil {
+				if clients[ua.devType].Set(&memcache.Item{Key: key, Value: data}) != nil {
 					localNumErrors++
 				}
 			}
@@ -53,55 +54,39 @@ func writer_thread(writeCh chan []user_apps, clients map[string]*memcache.Client
 }
 
 
-func parseLine(line []string) (user_apps, bool) {
-	errors := false
+func parseLine(line []string) (userApps, error) {
+	var err error
 
-	ua := new(user_apps)
+	ua := new(userApps)
 
 	// need for key
-	ua.dev_type = line[0]
-	ua.dev_id = line[1]
+	ua.devType = line[0]
+	ua.devId = line[1]
 
 	// lat
 	if lat, err := strconv.ParseFloat(line[2], 64); err == nil {
 		ua.lat = lat
-	} else {
-		errors = true
 	}
+
 	// lon
 	if lon, err := strconv.ParseFloat(line[3], 64); err == nil {
 		ua.lon = lon
-	} else {
-		errors = true
 	}
 
 	// apps
 	for _, app := range(strings.Split(line[4], ",")) {
 		if val, err := strconv.ParseUint(app, 10, 64); err == nil {
 			ua.apps = append(ua.apps, uint32(val))
-		} else {
-			errors = true
 		}
 	}
 
-	if errors {
-		return *ua, false
-
-	} else {
-		return *ua, true
-	}
+	return *ua, err
 
 }
 
 
-func reader_thread(readCh chan string, writeCh chan []user_apps, numberLines int, numLines, numErrors *uint64) {
-	for {
-
-		filename, ok := <-readCh
-		// Close chanel
-		if !ok {
-			break
-		}
+func reader(readCh chan string, writeCh chan []userApps, numberLines int, numLines, numErrors *uint64) {
+	for filename := range readCh {
 
 		filereader, err := os.Open(filename)
 		if err != nil {
@@ -120,7 +105,7 @@ func reader_thread(readCh chan string, writeCh chan []user_apps, numberLines int
 		csvreader.FieldsPerRecord = 5
 
 		counterLines := numberLines
-		var lines []user_apps
+		var lines []userApps
 		var localNumErrors uint64 = 0
 		var localNumLines uint64 = 0
 
@@ -140,14 +125,15 @@ func reader_thread(readCh chan string, writeCh chan []user_apps, numberLines int
 				}
 			}
 
-			ua, right := parseLine(line)
-			if right {
+			ua, err := parseLine(line)
+			if err == nil {
 				lines = append(lines, ua)
 				if counterLines == 0 {
 					writeCh <- lines
 					lines = lines[:0]
 				}
 			} else {
+				log.Printf("Error parse line %s", err)
 				localNumErrors++
 			}
 		}
@@ -157,15 +143,15 @@ func reader_thread(readCh chan string, writeCh chan []user_apps, numberLines int
 		atomic.AddUint64(numErrors, localNumErrors)
 
 		// rename file
-		_ = greader.Close()
-		_ = filereader.Close()
+		greader.Close()
+		filereader.Close()
 
-		_ = os.Rename(filename, filepath.Join(filepath.Dir(filename), "." + filepath.Base(filename)))
+		os.Rename(filename, filepath.Join(filepath.Dir(filename), "." + filepath.Base(filename)))
 	}
 }
 
 
-func read_files(pattern string, read_ch chan string) {
+func readFiles(pattern string, readCh chan string) {
 	var (
 		files []string
 		err   error
@@ -177,7 +163,7 @@ func read_files(pattern string, read_ch chan string) {
 	}
 
 	for _, filename := range (files) {
-		read_ch <- filename
+		readCh <- filename
 	}
 }
 
@@ -215,27 +201,27 @@ func main() {
 		"idfa": *idfa, "gaid": *gaid, "adid": *adid, "dvid": *dvid})
 
 	readCh := make(chan string, 100)
-	writeCh := make(chan []user_apps, 200)
+	writeCh := make(chan []userApps, 200)
 	var numLines  uint64 = 0
 	var numErrors uint64 = 0
 
 	for i := 0; i < *readers; i++ {
-		go reader_thread(readCh, writeCh, *numberLines, &numLines, &numErrors)
+		go reader(readCh, writeCh, *numberLines, &numLines, &numErrors)
 	}
 
 	for i := 0; i < *writers; i++ {
-		go writer_thread(writeCh, clients, &numErrors)
+		go writer(writeCh, clients, &numErrors)
 	}
 
-	read_files(*pattern, readCh)
+	readFiles(*pattern, readCh)
 
 	var normallErrorRate float64 = 0.01
 	if numLines != numErrors {
-		err_rate := float64(numErrors) / float64(numLines - numErrors)
-		if err_rate < normallErrorRate {
-			log.Println("Acceptable error rate %s. Successfull load", err_rate)
+		errRate := float64(numErrors) / float64(numLines - numErrors)
+		if errRate < normallErrorRate {
+			log.Println("Acceptable error rate %s. Successfull load", errRate)
 		} else {
-			log.Println("High error rate %s. Failed load", err_rate)
+			log.Println("High error rate %s. Failed load", errRate)
 		}
 	} else {
 		log.Println("Very sad - 0% preceed")

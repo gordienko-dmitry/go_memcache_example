@@ -1,4 +1,4 @@
-## OTUS GO Concurrency
+## GO MEMCACHE EXAMPLE
 
 It's loader specific format files to memcached storage.  
 
